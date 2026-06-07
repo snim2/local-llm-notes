@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""notes-rag — local RAG over ~/local-llms/note/.
+
+Subcommands:
+    notes-rag index [--rebuild]
+    notes-rag stats
+    notes-rag ask "<question>" [--k N]
+    notes-rag watch
+
+Storage: one SQLite file at ~/local-llms/notes-rag-data/vectors.db
+(files + chunks + sqlite-vec virtual table for the embeddings).
+
+PDFs: pymupdf text extraction first; pages below PDF_TEXT_MIN_CHARS get
+rasterized and sent to the local mlx-vlm server for vision-based
+transcription via Gemma 4 Unified.
+"""
+
+# === IMPORTS ===
+import os
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+import argparse
+import base64
+import hashlib
+import json
+import queue
+import re
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+
+# === CONFIG ===
+CORPUS_ROOT = Path.home() / "local-llms" / "notes"  # Use the test data folder for benchmarking.
+DATA_DIR = Path.home() / "local-llms" / "notes-rag-data"
+DB_PATH = DATA_DIR / "vectors.db"
+
+# Vision-PDF transcription during indexing always uses the 12B server.
+# E4B's vision quality is noticeably worse for OCR-style transcription.
+VISION_SERVER_URL = "http://127.0.0.1:8080/v1"
+VISION_LLM_MODEL = "mlx-community/gemma-4-12B-it-OptiQ-4bit"
+
+# Answer generation: default to E4B (port 8081) for snappy queries.
+# `notes-rag ask --big` opts into the 12B on port 8080 for harder synthesis.
+ASK_BACKENDS = {
+    "fast": (
+        "http://127.0.0.1:8081/v1",
+        "mlx-community/gemma-4-e4b-it-OptiQ-4bit",
+    ),
+    "big": (
+        "http://127.0.0.1:8080/v1",
+        "mlx-community/gemma-4-12B-it-OptiQ-4bit",
+    ),
+}
+
+EMBED_MODEL = "mlx-community/bge-small-en-v1.5-bf16"
+EMBED_DIM = 384
+EMBED_BATCH_SIZE = 32
+
+TARGET_CHUNK_TOKENS = 500
+MAX_CHUNK_TOKENS = 800
+CHUNK_OVERLAP_TOKENS = 50
+
+DEFAULT_TOP_K = 4
+SUPPORTED_EXTS = {".md", ".txt", ".pdf"}
+
+PDF_TEXT_MIN_CHARS = 50
+PDF_VISION_DPI = 200
+VISION_TIMEOUT_SECONDS = 180
+GENERATE_TIMEOUT_SECONDS = 300
+
+WATCH_DEBOUNCE_SECONDS = 2.0
+
+
+# === DB ===
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (
+    id           INTEGER PRIMARY KEY,
+    path         TEXT UNIQUE NOT NULL,
+    mtime        REAL NOT NULL,
+    sha256       TEXT NOT NULL,
+    last_indexed REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chunks (
+    rowid    INTEGER PRIMARY KEY,
+    file_id  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    citation TEXT NOT NULL,
+    content  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+"""
+
+
+def open_db():
+    import sqlite_vec
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.enable_load_extension(True)
+    except AttributeError:
+        sys.exit(
+            "Error: sqlite3 was built without enable_load_extension. "
+            "Reinstall Python from python.org or via a Homebrew build that "
+            "includes SQLite extension support."
+        )
+    sqlite_vec.load(conn)
+    conn.executescript(SCHEMA)
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks "
+        f"USING vec0(embedding FLOAT[{EMBED_DIM}])"
+    )
+    return conn
+
+
+def drop_all(conn):
+    conn.execute("DROP TABLE IF EXISTS vec_chunks")
+    conn.execute("DROP TABLE IF EXISTS chunks")
+    conn.execute("DROP TABLE IF EXISTS files")
+    conn.executescript(SCHEMA)
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks "
+        f"USING vec0(embedding FLOAT[{EMBED_DIM}])"
+    )
+    conn.commit()
+
+
+def delete_file_chunks(conn, file_id):
+    rowids = [r[0] for r in conn.execute(
+        "SELECT rowid FROM chunks WHERE file_id = ?", (file_id,))]
+    for rid in rowids:
+        conn.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rid,))
+    conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+
+
+# === EMBED ===
+_embedder = None
+
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        from mlx_embeddings.utils import load as load_embedder
+        _embedder = load_embedder(EMBED_MODEL)
+    return _embedder
+
+
+def embed_texts(texts):
+    """Return list of L2-normalized 384-d embeddings (one per input text)."""
+    import mlx.core as mx
+    model, tokenizer = get_embedder()
+    inputs = tokenizer.batch_encode_plus(
+        texts, return_tensors="mlx",
+        padding=True, truncation=True, max_length=512,
+    )
+    out = model(**inputs)
+    # BGE recommends using [CLS] token (position 0) then L2-normalize.
+    cls = out.last_hidden_state[:, 0]
+    norms = mx.sqrt((cls * cls).sum(axis=1, keepdims=True))
+    normed = cls / norms
+    return [list(map(float, v)) for v in normed.tolist()]
+
+
+# === CHUNK ===
+_tok_enc = None
+
+
+def tok_count(text):
+    global _tok_enc
+    if _tok_enc is None:
+        import tiktoken
+        _tok_enc = tiktoken.get_encoding("cl100k_base")
+    # disallowed_special=() so we don't reject text that happens to mention
+    # special-token strings like "<|endoftext|>" — they're just text here.
+    return len(_tok_enc.encode(text, disallowed_special=()))
+
+
+def split_sentences(text):
+    # Naive sentence split — good enough for chunking purposes.
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in parts if s.strip()]
+
+
+def windowed(text, target=TARGET_CHUNK_TOKENS, overlap=CHUNK_OVERLAP_TOKENS):
+    """Sentence-aware sliding window. Returns list[str]."""
+    sents = split_sentences(text)
+    if not sents:
+        s = text.strip()
+        return [s] if s else []
+    chunks = []
+    cur = []
+    cur_toks = 0
+    for s in sents:
+        n = tok_count(s)
+        if cur and cur_toks + n > target:
+            chunks.append(" ".join(cur))
+            # Build overlap tail
+            tail = []
+            tail_toks = 0
+            for back in reversed(cur):
+                bt = tok_count(back)
+                if tail_toks + bt > overlap:
+                    break
+                tail.insert(0, back)
+                tail_toks += bt
+            cur = tail
+            cur_toks = tail_toks
+        cur.append(s)
+        cur_toks += n
+    if cur:
+        chunks.append(" ".join(cur))
+    return chunks
+
+
+def chunk_markdown(text, rel_path):
+    """Yield (citation, content) tuples, section-aware on ATX headers."""
+    lines = text.splitlines()
+    stack = []   # [(level, title), ...]
+    cur_lines = []
+    sections = []  # [(heading_path_str, body_str)]
+
+    def flush():
+        if not cur_lines:
+            return
+        path_str = " > ".join(t for _, t in stack)
+        body = "\n".join(cur_lines).strip()
+        if body:
+            sections.append((path_str, body))
+
+    for line in lines:
+        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if m:
+            flush()
+            cur_lines = []
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+        else:
+            cur_lines.append(line)
+    flush()
+
+    for heading_path, body in sections:
+        citation_base = (
+            f"{rel_path} § {heading_path}" if heading_path else f"{rel_path}"
+        )
+        if tok_count(body) <= MAX_CHUNK_TOKENS:
+            yield citation_base, body
+        else:
+            for w in windowed(body):
+                yield citation_base, w
+
+
+def chunk_text(text, rel_path):
+    """Paragraph-aware sliding windows for .txt files."""
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return
+    cur = []
+    cur_toks = 0
+    cur_start = 0
+    for i, para in enumerate(paragraphs):
+        n = tok_count(para)
+        if cur and cur_toks + n > TARGET_CHUNK_TOKENS:
+            yield f"{rel_path} ¶{cur_start + 1}", "\n\n".join(cur)
+            # One-paragraph overlap
+            cur = [cur[-1]]
+            cur_toks = tok_count(cur[0])
+            cur_start = i - 1
+        cur.append(para)
+        cur_toks += n
+    if cur:
+        yield f"{rel_path} ¶{cur_start + 1}", "\n\n".join(cur)
+
+
+def _page_to_png_b64(page, dpi):
+    pix = page.get_pixmap(dpi=dpi)
+    return base64.b64encode(pix.tobytes("png")).decode()
+
+
+def _llm_transcribe_image(b64):
+    body = json.dumps({
+        "model": VISION_LLM_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text",
+                 "text": (
+                     "Transcribe this page exactly. Preserve structure, lists, "
+                     "and headings. For diagrams or figures, give a brief "
+                     "factual description. Do not summarize the contents."
+                 )},
+            ],
+        }],
+        "max_tokens": 1800,
+        "temperature": 0.0,
+    }).encode()
+    req = urllib.request.Request(
+        f"{VISION_SERVER_URL}/chat/completions",
+        data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=VISION_TIMEOUT_SECONDS) as r:
+        return json.load(r)["choices"][0]["message"]["content"]
+
+
+def chunk_pdf(abs_path, rel_path):
+    import fitz
+    doc = fitz.open(abs_path)
+    try:
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text("text").strip()
+            citation_tag = ""
+            content = text
+            if len(text) < PDF_TEXT_MIN_CHARS:
+                try:
+                    b64 = _page_to_png_b64(page, PDF_VISION_DPI)
+                    content = _llm_transcribe_image(b64).strip()
+                    citation_tag = " (vision)"
+                except Exception as e:
+                    print(
+                        f"  vision fallback failed for {rel_path} p.{i}: "
+                        f"{e}; using sparse extracted text",
+                        file=sys.stderr,
+                    )
+            if not content.strip():
+                continue
+            for w in windowed(content):
+                yield f"{rel_path} p.{i}{citation_tag}", w
+    finally:
+        doc.close()
+
+
+# === LOAD ===
+def chunks_for_file(abs_path):
+    rel = str(abs_path.relative_to(CORPUS_ROOT))
+    ext = abs_path.suffix.lower()
+    if ext == ".md":
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+        yield from chunk_markdown(text, rel)
+    elif ext == ".txt":
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+        yield from chunk_text(text, rel)
+    elif ext == ".pdf":
+        yield from chunk_pdf(abs_path, rel)
+
+
+# === INDEX ===
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(65536), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def index_file(conn, abs_path):
+    """Index or refresh one file. Returns (chunks_added, was_new, was_skipped)."""
+    import sqlite_vec
+    rel = str(abs_path.relative_to(CORPUS_ROOT))
+    mtime = abs_path.stat().st_mtime
+    sha = sha256_of_file(abs_path)
+
+    row = conn.execute(
+        "SELECT id, sha256 FROM files WHERE path = ?", (rel,)
+    ).fetchone()
+    if row is not None and row[1] == sha:
+        return 0, False, True  # unchanged
+
+    if row is not None:
+        delete_file_chunks(conn, row[0])
+        conn.execute("DELETE FROM files WHERE id = ?", (row[0],))
+
+    chunks = list(chunks_for_file(abs_path))
+    cur = conn.execute(
+        "INSERT INTO files(path, mtime, sha256, last_indexed) VALUES (?, ?, ?, ?)",
+        (rel, mtime, sha, time.time()),
+    )
+    file_id = cur.lastrowid
+    if not chunks:
+        conn.commit()
+        return 0, row is None, False
+
+    contents = [c for _, c in chunks]
+    citations = [c for c, _ in chunks]
+    embeddings = []
+    for i in range(0, len(contents), EMBED_BATCH_SIZE):
+        embeddings.extend(embed_texts(contents[i:i + EMBED_BATCH_SIZE]))
+
+    for cite, content, emb in zip(citations, contents, embeddings):
+        cur = conn.execute(
+            "INSERT INTO chunks(file_id, citation, content) VALUES (?, ?, ?)",
+            (file_id, cite, content),
+        )
+        chunk_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+            (chunk_id, sqlite_vec.serialize_float32(emb)),
+        )
+    conn.commit()
+    return len(chunks), row is None, False
+
+
+def walk_corpus():
+    if not CORPUS_ROOT.exists():
+        return []
+    return sorted(
+        p for p in CORPUS_ROOT.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+    )
+
+
+def cmd_index(args):
+    conn = open_db()
+    if args.rebuild:
+        print("--rebuild: dropping existing index")
+        drop_all(conn)
+
+    on_disk = walk_corpus()
+    on_disk_rels = {str(p.relative_to(CORPUS_ROOT)) for p in on_disk}
+    db_paths = {r[0]: r[1] for r in conn.execute("SELECT path, id FROM files")}
+
+    # Removed files
+    for rel in sorted(set(db_paths) - on_disk_rels):
+        delete_file_chunks(conn, db_paths[rel])
+        conn.execute("DELETE FROM files WHERE id = ?", (db_paths[rel],))
+        print(f"  removed {rel}")
+    conn.commit()
+
+    total_new_chunks = 0
+    n_indexed = 0
+    n_skipped = 0
+    for path in on_disk:
+        rel = str(path.relative_to(CORPUS_ROOT))
+        try:
+            added, was_new, skipped = index_file(conn, path)
+        except Exception as e:
+            print(f"  error indexing {rel}: {e}", file=sys.stderr)
+            continue
+        if skipped:
+            n_skipped += 1
+            continue
+        n_indexed += 1
+        total_new_chunks += added
+        tag = " (new)" if was_new else ""
+        print(f"  indexed {rel}: {added} chunks{tag}")
+
+    print(
+        f"\n{n_indexed} files indexed, {n_skipped} unchanged, "
+        f"{total_new_chunks} chunks added/refreshed."
+    )
+    return 0
+
+
+# === STATS ===
+def cmd_stats(args):
+    conn = open_db()
+    n_files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    by_ext = conn.execute("""
+        SELECT
+            CASE
+                WHEN path LIKE '%.md'  THEN '.md'
+                WHEN path LIKE '%.txt' THEN '.txt'
+                WHEN path LIKE '%.pdf' THEN '.pdf'
+                ELSE 'other'
+            END AS ext,
+            COUNT(*)
+        FROM files GROUP BY ext ORDER BY 2 DESC
+    """).fetchall()
+
+    print(f"Corpus:   {CORPUS_ROOT}")
+    print(f"DB:       {DB_PATH}")
+    print(f"Files:    {n_files}")
+    print(f"Chunks:   {n_chunks}")
+    if by_ext:
+        print("By extension:")
+        for ext, n in by_ext:
+            print(f"  {ext}: {n}")
+    if DB_PATH.exists():
+        print(f"DB size:  {DB_PATH.stat().st_size / 1e6:.2f} MB")
+    return 0
+
+
+# === QUERY ===
+ANSWER_PROMPT = (
+    "Answer the question using ONLY the sources below. Cite each claim with "
+    "[S1], [S2], etc., matching the source labels. If the sources don't "
+    "contain the answer, say so plainly — do not invent.\n\n"
+    "{sources}\n\n"
+    "Question: {question}"
+)
+
+
+def cmd_ask(args):
+    import sqlite_vec
+    conn = open_db()
+    n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    if n_chunks == 0:
+        print("Index is empty. Run `notes-rag index` first.", file=sys.stderr)
+        return 1
+
+    qvec = embed_texts([args.question])[0]
+    rows = conn.execute("""
+        SELECT c.citation, c.content, v.distance
+        FROM vec_chunks v
+        JOIN chunks c ON c.rowid = v.rowid
+        WHERE v.embedding MATCH ? AND k = ?
+        ORDER BY v.distance
+    """, (sqlite_vec.serialize_float32(qvec), args.k)).fetchall()
+
+    if not rows:
+        print("No matching chunks.")
+        return 0
+
+    sources_block = "\n\n".join(
+        f"[S{i+1}] {cite}\n{content}"
+        for i, (cite, content, _) in enumerate(rows)
+    )
+    prompt = ANSWER_PROMPT.format(
+        sources=sources_block, question=args.question,
+    )
+
+    backend = "big" if args.big else "fast"
+    server_url, llm_model = ASK_BACKENDS[backend]
+
+    body = json.dumps({
+        "model": llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 800,
+        "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(
+        f"{server_url}/chat/completions",
+        data=body, headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=GENERATE_TIMEOUT_SECONDS) as r:
+            answer = json.load(r)["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"LLM call failed: {e}", file=sys.stderr)
+        port = server_url.rsplit(":", 1)[1].split("/")[0]
+        which = "12B (./serve.sh)" if args.big else "E4B (./serve-e4b.sh)"
+        print(f"Is the {which} server on :{port} running?", file=sys.stderr)
+        return 1
+
+    print(answer)
+    print(f"\nSources (model: {llm_model.rsplit('/', 1)[1]}, k={args.k}):")
+    for i, (cite, _, dist) in enumerate(rows, start=1):
+        print(f"  [S{i}] {cite}  (distance={dist:.3f})")
+    return 0
+
+
+# === WATCH ===
+def cmd_watch(args):
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+
+    conn = open_db()
+    print(f"Watching {CORPUS_ROOT} (Ctrl+C to stop)")
+
+    event_queue = queue.Queue()
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            if event.is_directory:
+                return
+            paths = [event.src_path]
+            if getattr(event, "dest_path", None):
+                paths.append(event.dest_path)
+            for raw in paths:
+                p = Path(raw)
+                if p.suffix.lower() in SUPPORTED_EXTS:
+                    event_queue.put(p)
+
+    obs = Observer()
+    obs.schedule(Handler(), str(CORPUS_ROOT), recursive=True)
+    obs.start()
+
+    stop_flag = threading.Event()
+
+    def handle_sigint(signum, frame):
+        stop_flag.set()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    try:
+        while not stop_flag.is_set():
+            try:
+                first = event_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            pending = {first}
+            deadline = time.time() + WATCH_DEBOUNCE_SECONDS
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    pending.add(event_queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            for path in sorted(pending):
+                ts = datetime.now().strftime("%H:%M:%S")
+                try:
+                    rel = str(path.relative_to(CORPUS_ROOT))
+                except ValueError:
+                    continue
+                try:
+                    if path.exists():
+                        added, was_new, skipped = index_file(conn, path)
+                        if skipped:
+                            print(f"[{ts}] {rel}: unchanged")
+                        else:
+                            tag = " (new)" if was_new else ""
+                            print(f"[{ts}] reindexed {rel}: {added} chunks{tag}")
+                    else:
+                        row = conn.execute(
+                            "SELECT id FROM files WHERE path = ?", (rel,)
+                        ).fetchone()
+                        if row:
+                            delete_file_chunks(conn, row[0])
+                            conn.execute(
+                                "DELETE FROM files WHERE id = ?", (row[0],)
+                            )
+                            conn.commit()
+                            print(f"[{ts}] removed {rel}")
+                except Exception as e:
+                    print(f"[{ts}] error processing {rel}: {e}", file=sys.stderr)
+    finally:
+        obs.stop()
+        obs.join()
+    return 0
+
+
+# === CLI ===
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="notes-rag",
+        description="Local RAG over ~/local-llms/notes/.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_idx = sub.add_parser("index", help="index (incremental) the corpus")
+    p_idx.add_argument("--rebuild", action="store_true",
+                       help="drop everything and reindex from scratch")
+    p_idx.set_defaults(func=cmd_index)
+
+    p_ask = sub.add_parser("ask", help="query the corpus")
+    p_ask.add_argument("question")
+    p_ask.add_argument(
+        "--k", type=int, default=DEFAULT_TOP_K,
+        help=f"top-k chunks to retrieve (default {DEFAULT_TOP_K})",
+    )
+    p_ask.add_argument(
+        "--big", action="store_true",
+        help="use the 12B server on :8080 instead of E4B on :8081 "
+             "(slower, better for hard synthesis)",
+    )
+    p_ask.set_defaults(func=cmd_ask)
+
+    p_stats = sub.add_parser("stats", help="show index inventory")
+    p_stats.set_defaults(func=cmd_stats)
+
+    p_watch = sub.add_parser("watch", help="watch corpus and reindex on changes")
+    p_watch.set_defaults(func=cmd_watch)
+
+    return p
+
+
+def main():
+    # Line-buffer stdout so `notes-rag watch > log.txt` shows progress
+    # without waiting for an 8K block to fill (or a clean shutdown).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
