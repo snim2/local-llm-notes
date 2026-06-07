@@ -1,0 +1,32 @@
+#!/bin/bash
+# aider-quick: hermetic one-shot Q&A to the local Gemma model via Aider.
+# Usage: aider-quick <message...>
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $(basename "$0") <message...>" >&2
+    echo "Example: $(basename "$0") explain monads in one sentence" >&2
+    exit 1
+fi
+
+SERVER_URL="http://127.0.0.1:8080"
+MODEL="openai/mlx-community/gemma-4-12B-it-OptiQ-4bit"
+
+if ! curl -fsS --max-time 2 "$SERVER_URL/v1/models" > /dev/null; then
+    echo "Error: mlx-lm server not reachable at $SERVER_URL" >&2
+    echo "Start it first (e.g. ./serve.sh)" >&2
+    exit 1
+fi
+
+# Pass env vars and model explicitly so the script doesn't depend on
+# aider's auto-loading of ~/.env or ~/.aider.conf.yml.
+OPENAI_API_BASE="$SERVER_URL/v1" \
+OPENAI_API_KEY="dummy" \
+aider \
+    --model "$MODEL" \
+    --message "$*" \
+    --chat-mode ask \
+    --no-git \
+    --no-show-model-warnings \
+    --yes-always \
+    --no-analytics
