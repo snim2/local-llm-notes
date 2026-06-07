@@ -21,16 +21,24 @@ brew install python@3.12 jq curl
 
 ## 1. Get the project files
 
-Either clone (if it's in a repo) or `scp -r snim2@old-machine:~/local-llms ~/`.
-The directory contains the serve scripts, helper scripts, and `requirements.txt`.
+Clone the repo into `~/local-llms`. The remote name is `local-llm-notes`
+but every script and config in this project assumes the directory is
+called `local-llms`, so rename on clone:
 
 ```bash
+git clone git@github.com:snim2/local-llm-notes.git ~/local-llms
 cd ~/local-llms
 ls
 ```
 
 You should see at minimum: `serve.sh`, `serve-e4b.sh`, `requirements.txt`,
-`curl-ask`, `aider-quick`, `aider-ask`, `aider-edit`, `gemma-history.py`.
+`curl-ask`, `aider-quick`, `aider-ask`, `aider-edit`, `gemma-history.py`,
+`notes-rag`.
+
+The repo does **not** include `notes/`, `notes-rag-data/`, `HANDOVER.md`,
+the `venv/`, or any `.aider*` history files — those are gitignored as
+personal/machine-local. You'll create the venv in §2 and the notes
+directory in §14.
 
 ## 2. Python venv + MLX install
 
