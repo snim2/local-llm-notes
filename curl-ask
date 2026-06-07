@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -euo pipefail 
+
+jq -n --arg msg "$*" '{
+    model: "mlx-community/gemma-4-12B-it-OptiQ-4bit",
+    messages: [{role: "user", content: $msg}]
+  }' | curl -s http://127.0.0.1:8080/v1/chat/completions \
+         -H 'Content-Type: application/json' \
+         --data-binary @- \
+    | jq -r '.choices[0].message.content'
