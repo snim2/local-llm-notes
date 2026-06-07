@@ -1,0 +1,16 @@
+# Local-LLM venv dependencies (Apple Silicon, MLX runtime).
+#
+# mlx-vlm transitively pulls in mlx, mlx-lm, mlx-audio, transformers,
+# tokenizers, fastapi, uvicorn, and the rest of the chat-completions stack.
+#
+# notes-rag adds: sqlite-vec (vector store), pymupdf (PDF text/images),
+# watchdog (file watcher), mlx-embeddings (bge-small via MLX), tiktoken
+# (chunk token-counting).
+#
+# See HOWTO.md for full setup instructions.
+mlx-vlm==0.6.2
+sqlite-vec
+pymupdf
+watchdog
+mlx-embeddings
+tiktoken
