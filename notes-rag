@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""notes-rag — local RAG over ~/local-llms/note/.
+"""notes-rag — local RAG over ~/local-llms/notes/.
 
 Subcommands:
     notes-rag index [--rebuild]

@@ -312,7 +312,7 @@ All in `~/local-llms/`:
 | `aider-ask "<msg>"`   | Aider Q&A in current project (uses git, may prompt). For codebase questions. |
 | `aider-edit`          | Interactive Aider edit session (whole-file edits, no auto-commits). |
 | `gemma-history.py`  | Weekly zsh-history analyst. |
-| `notes-rag`         | Local RAG over `note/`: `index`, `ask`, `stats`, `watch`. See §14. |
+| `notes-rag`         | Local RAG over `notes/`: `index`, `ask`, `stats`, `watch`. See §14. |
 
 ## 11. Troubleshooting
 
@@ -389,7 +389,7 @@ the rest.
 
 ```
 ~/local-llms/
-├── note/                  # drop your .md / .txt / .pdf files here
+├── notes/                 # drop your .md / .txt / .pdf files here
 ├── notes-rag              # the CLI
 └── notes-rag-data/
     └── vectors.db         # SQLite: files + chunks + sqlite-vec embeddings
@@ -451,7 +451,7 @@ rasterized page — useful if you want to spot-check transcription quality.
 ./notes-rag watch
 ```
 
-Runs in the foreground. Watches `note/` recursively. Debounces events
+Runs in the foreground. Watches `notes/` recursively. Debounces events
 for 2 s, then reindexes the union of changed paths. Logs each
 re-index / removal with a timestamp. Ctrl+C to stop.
 
