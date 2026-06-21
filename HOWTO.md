@@ -276,6 +276,43 @@ curl -s http://127.0.0.1:8081/v1/models | python3 -m json.tool
 If you used Option A for opencode config above, you're done — opencode
 already points at port 8081.
 
+## 8a. Optional: VSCode code autocomplete (Continue + Qwen2.5-Coder)
+
+Gemma is a general instruct model, not a fill-in-the-middle (FIM) coder,
+so it makes weak inline completions and the 12B is too slow for ghost-text
+(~14 tok/s). The working setup is a **split**: a tiny dedicated FIM coder
+for autocomplete, Gemma for sidebar chat.
+
+`serve-continue.sh` runs Qwen2.5-Coder 1.5B (base, FIM) on port **8082** via
+`mlx_lm.server` — note this is the plain `mlx_lm.server`, not `mlx_vlm`
+(Qwen is a standard text arch). At ~1 GB / 4-bit it's small and fast
+enough to run alongside the 12B without swapping.
+
+In a third terminal:
+
+```bash
+cd ~/local-llms
+source venv/bin/activate
+./serve-continue.sh
+```
+
+First run downloads `mlx-community/Qwen2.5-Coder-1.5B-4bit` (~1 GB). If
+that exact repo 404s, search Hugging Face for `mlx-community
+Qwen2.5-Coder-1.5B` and update the `--model` line (the `-Instruct-4bit`
+variant is a fallback; base is preferred for FIM). Smoke test:
+
+```bash
+curl -s http://127.0.0.1:8082/v1/models | python3 -m json.tool
+```
+
+Then install the **Continue** extension in VSCode. It reads
+`~/.continue/config.yaml`, already written to route chat/edit to the 12B
+(8080) and autocomplete to the coder (8082). Type in a code file for grey
+ghost-text (Tab accepts); Cmd+L opens chat against Gemma.
+
+Memory caveat: 12B (~11 GB) + coder (~1 GB) is fine on 16 GB, but adding
+the E4B server on top will swap — run at most two of the three.
+
 ## 9. Optional: schedule the shell-history report
 
 `gemma-history.py` reads the last 7 days of `~/.zsh_history`, distills
