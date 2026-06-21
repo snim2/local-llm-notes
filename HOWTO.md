@@ -313,6 +313,35 @@ ghost-text (Tab accepts); Cmd+L opens chat against Gemma.
 Memory caveat: 12B (~11 GB) + coder (~1 GB) is fine on 16 GB, but adding
 the E4B server on top will swap — run at most two of the three.
 
+Run `mkdir -p $HOME/.continue` to store new configuration. Add the following
+to `$HOME/.continue/config.yaml` (assumes you have both Qwen coder and Gemma,
+as described above):
+
+```yaml
+name: local-gemma
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Gemma 4 12B (chat)
+    provider: openai
+    model: mlx-community/gemma-4-12B-it-OptiQ-4bit
+    apiBase: http://127.0.0.1:8080/v1
+    apiKey: none
+    roles:
+      - chat
+      - edit
+      - apply
+
+  - name: Qwen2.5-Coder 1.5B (autocomplete)
+    provider: openai
+    model: mlx-community/Qwen2.5-Coder-1.5B-4bit
+    apiBase: http://127.0.0.1:8082/v1
+    apiKey: none
+    roles:
+      - autocomplete
+```
+
 ## 9. Optional: schedule the shell-history report
 
 `gemma-history.py` reads the last 7 days of `~/.zsh_history`, distills
